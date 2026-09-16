@@ -7,11 +7,21 @@ bl_info = {
 import bpy
 import sounddevice as sd
 import numpy as np
+import os
+import time
+import wave
 
 # Globals
 current_volume = 0.0
 stream = None
 should_run = False
+
+# Recording state
+wav_file = None
+record_path = ""
+record_start_frame = 0
+last_strip_refresh = 0.0
+RECORD_REFRESH = 0.5  # seconds between live waveform strip refreshes
 
 # Device cache
 DEVICE_ITEMS = []
@@ -76,12 +86,97 @@ class AudioRigSettings(bpy.types.PropertyGroup):
     )
     volume_scale: bpy.props.FloatProperty(name="Volume to Value Scale", default=1.0)
     update_interval: bpy.props.FloatProperty(name="Update Interval (s)", default=0.05, min=0.001, max=1.0)
+    record_to_timeline: bpy.props.BoolProperty(
+        name="Record to Timeline",
+        description="Record the microphone to a WAV file and show it as a growing waveform strip in the Video Sequencer",
+        default=True
+    )
 
 # Audio callback
 def audio_callback(indata, frames, time, status):
     global current_volume
     volume = np.linalg.norm(indata) / frames
     current_volume = min(volume, 1.0)  # clamp to 1.0 for safety
+    if wav_file is not None:
+        try:
+            wav_file.writeframes((indata[:, 0] * 32767.0).astype('<i2').tobytes())
+        except Exception as e:
+            print(f"MAD WAV write failed: {e}")
+
+# --- Timeline recording helpers ---
+def get_record_dir():
+    blend = bpy.path.abspath("//")
+    if blend and os.path.isdir(blend):
+        return blend
+    return "/tmp"
+
+def _strips_collection(se):
+    # Blender 5.x renamed sequences -> strips; support both
+    return se.strips if hasattr(se, "strips") else se.sequences
+
+def _all_strips(se):
+    return se.strips_all if hasattr(se, "strips_all") else se.sequences_all
+
+def _remove_live_strip(scene):
+    se = scene.sequence_editor
+    if se is None:
+        return
+    for strip in list(_all_strips(se)):
+        if strip.name.startswith("MAD Recording"):
+            _strips_collection(se).remove(strip)
+
+def _add_live_strip(scene, muted):
+    if scene.sequence_editor is None:
+        scene.sequence_editor_create()
+    se = scene.sequence_editor
+    strip = _strips_collection(se).new_sound("MAD Recording", record_path, channel=1, frame_start=record_start_frame)
+    strip.mute = muted
+    se.active_strip = strip
+    # Ask the Sequencer timeline to redraw so the waveform grows visibly
+    for window in bpy.context.window_manager.windows:
+        for area in window.screen.areas:
+            if area.type == 'SEQUENCE_EDITOR':
+                area.tag_redraw()
+    return strip
+
+def start_recording(context, samplerate):
+    global wav_file, record_path, record_start_frame, last_strip_refresh
+    record_path = os.path.join(get_record_dir(), time.strftime("MAD_%Y%m%d_%H%M%S.wav"))
+    record_start_frame = context.scene.frame_current
+    wf = wave.open(record_path, "wb")
+    wf.setnchannels(1)
+    wf.setsampwidth(2)
+    wf.setframerate(int(samplerate))
+    wav_file = wf
+    last_strip_refresh = time.monotonic()
+    # Muted while recording so the mic doesn't feed back through the speakers
+    _add_live_strip(context.scene, muted=True)
+
+def refresh_recording_strip():
+    global last_strip_refresh
+    if wav_file is None:
+        return
+    now = time.monotonic()
+    if now - last_strip_refresh < RECORD_REFRESH:
+        return
+    last_strip_refresh = now
+    scene = bpy.context.scene
+    _remove_live_strip(scene)
+    _add_live_strip(scene, muted=True)
+
+def stop_recording(context):
+    global wav_file
+    if wav_file is None:
+        return None
+    try:
+        wav_file.close()
+    except Exception:
+        pass
+    wav_file = None
+    scene = context.scene
+    _remove_live_strip(scene)
+    strip = _add_live_strip(scene, muted=False)
+    return strip
 
 # Blender-safe update loop
 def update_bone_rotation():
@@ -93,6 +188,9 @@ def update_bone_rotation():
     obj = s.object_ref
     # Update the UI audio level property
     bpy.context.scene["mad_audio_level"] = current_volume
+
+    if s.record_to_timeline:
+        refresh_recording_strip()
 
     if not obj:
         return s.update_interval
@@ -162,6 +260,13 @@ class AUDIO_OT_Start(bpy.types.Operator):
             self.report({'ERROR'}, f"Failed to start mic stream: {e}")
             return {'CANCELLED'}
 
+        if s.record_to_timeline:
+            try:
+                start_recording(context, stream.samplerate)
+            except Exception as e:
+                print(f"MAD timeline recording failed to start: {e}")
+                self.report({'WARNING'}, f"Timeline recording failed: {e}")
+
         bpy.app.timers.register(update_bone_rotation)
         return {'FINISHED'}
 
@@ -178,6 +283,9 @@ class AUDIO_OT_Stop(bpy.types.Operator):
             stream.stop()
             stream.close()
             stream = None
+        strip = stop_recording(context)
+        if strip is not None:
+            self.report({'INFO'}, f"Recording saved: {record_path}")
         return {'FINISHED'}
 
 # UI Panel
@@ -201,6 +309,7 @@ class AUDIO_PT_MicDriverPanel(bpy.types.Panel):
         layout.prop(s, "property_path")
         layout.prop(s, "volume_scale")
         layout.prop(s, "update_interval")
+        layout.prop(s, "record_to_timeline")
 
         row = layout.row()
         row.operator("wm.audio_driver_ui_start", text="Start")
