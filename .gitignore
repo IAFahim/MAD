@@ -3,3 +3,4 @@ MAD/.DS_Store
 MAD/wheels/.DS_Store
 MAD_OSX/.DS_Store
 *.zip
+__pycache__/
