@@ -3,7 +3,7 @@ schema_version = "1.0.0"
 # Example of manifest file for a Blender extension
 # Change the values according to your extension
 id = "MAD"
-version = "0.1.6"
+version = "3.11.0"
 name = "MAD (Microphone Audio Driver)"
 tagline = "Use your Microphone as an Animation Driver in Blender"
 maintainer = "F1dg3t <f1dg3t.rah@gmail.com>"
@@ -38,9 +38,9 @@ platforms = ["windows-x64", "windows-arm64"]
 # Optional: bundle 3rd party Python modules.
 # https://docs.blender.org/manual/en/dev/extensions/python_wheels.html
 wheels = [
-  "./wheels/cffi-1.17.1-cp311-cp311-win_amd64.whl",
-  "./wheels/pycparser-2.22-py3-none-any.whl",
-  "./wheels/sounddevice-0.5.1-py3-none-win_amd64.whl"
+  "./wheels/cffi-2.1.1-cp311-cp311-win_amd64.whl",
+  "./wheels/pycparser-3.0-py3-none-any.whl",
+  "./wheels/sounddevice-0.5.6-py3-none-win_amd64.whl"
 ]
 
 # Optional: add-ons can list which resources they will require:
