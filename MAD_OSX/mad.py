@@ -8,6 +8,8 @@ import bpy
 import sounddevice as sd
 import numpy as np
 import os
+import atexit
+import tempfile
 import time
 import wave
 
@@ -23,13 +25,77 @@ record_start_frame = 0
 last_strip_refresh = 0.0
 RECORD_REFRESH = 0.5  # seconds between live waveform strip refreshes
 
+# Virtual app sources exposed by PipeWire/PulseAudio; they capture an app's
+# output, not a microphone, so hide them from the device list
+_VIRTUAL_SOURCES = {
+    "blender", "firefox", "librewolf", "chromium", "google chrome", "chrome",
+    "vlc", "mpv", "obs", "audacity", "steam", "wine", "discord", "spotify",
+    "telegram", "discordscreenaudio",
+}
+
+def _is_real_microphone(name):
+    n = name.strip().lower()
+    if not n or len(n) < 3:
+        return False
+    if "monitor" in n:
+        return False
+    if any(ord(c) < 32 for c in name):
+        return False
+    return n not in _VIRTUAL_SOURCES
+
+def _close_wav_safely():
+    global wav_file
+    if wav_file is not None:
+        try:
+            wav_file.close()
+        except Exception:
+            pass
+        wav_file = None
+
+# If Blender quits mid-recording, still finalize the WAV header so the file plays
+atexit.register(_close_wav_safely)
+
+def _stop_stream():
+    global stream
+    if stream:
+        try:
+            stream.stop()
+            stream.close()
+        except Exception:
+            pass
+        stream = None
+
+def _resolve_device(name):
+    """Map a stored device name to a current index; indices shift as apps
+    open and close audio streams, so names are the stable key."""
+    try:
+        devices = sd.query_devices()
+    except Exception:
+        return None
+    if name in (None, "", "default"):
+        return sd.default.device[0]
+    for i, d in enumerate(devices):
+        if d["name"] == name and d["max_input_channels"] > 0:
+            return i
+    for i, d in enumerate(devices):
+        if d["max_input_channels"] > 0 and name in d["name"]:
+            return i
+    return None
+
 # UI Properties
 def get_microphone_items(self, context):
     items = []
-    for i, device in enumerate(sd.query_devices()):
-        if device["max_input_channels"] > 0:
-            label = f"{i}:{device['name']}"
-            items.append((label, device["name"], ""))
+    try:
+        devices = sd.query_devices()
+        default_in = sd.default.device[0]
+    except Exception:
+        return []
+    for i, device in enumerate(devices):
+        if device["max_input_channels"] > 0 and _is_real_microphone(device["name"]):
+            tag = "  (default)" if i == default_in else ""
+            items.append((device["name"], device["name"] + tag, ""))
+    if not items:
+        items.append(("default", "Default Input", ""))
     return items
 
 class AudioRigSettings(bpy.types.PropertyGroup):
@@ -71,7 +137,6 @@ def audio_callback(indata, frames, time, status):
         print(f"[MAD] Stream status: {status}")
     volume = np.linalg.norm(indata) / frames
     current_volume = min(volume, 1.0)
-    print(f"[MAD] Volume: {current_volume:.3f}")
     if wav_file is not None:
         try:
             wav_file.writeframes((indata[:, 0] * 32767.0).astype('<i2').tobytes())
@@ -80,10 +145,12 @@ def audio_callback(indata, frames, time, status):
 
 # --- Timeline recording helpers ---
 def get_record_dir():
-    blend = bpy.path.abspath("//")
-    if blend and os.path.isdir(blend):
-        return blend
-    return "/tmp"
+    # Only claim the .blend folder when the file is actually saved there
+    if bpy.data.filepath:
+        d = os.path.dirname(bpy.path.abspath(bpy.data.filepath))
+        if os.path.isdir(d):
+            return d
+    return tempfile.gettempdir()
 
 def _strips_collection(se):
     # Blender 5.x renamed sequences -> strips; support both
@@ -140,14 +207,9 @@ def refresh_recording_strip():
     _add_live_strip(scene, muted=True)
 
 def stop_recording(context):
-    global wav_file
-    if wav_file is None:
+    _close_wav_safely()
+    if not record_path or not os.path.isfile(record_path):
         return None
-    try:
-        wav_file.close()
-    except Exception:
-        pass
-    wav_file = None
     scene = context.scene
     _remove_live_strip(scene)
     strip = _add_live_strip(scene, muted=False)
@@ -157,16 +219,17 @@ def stop_recording(context):
 def update_bone_rotation():
     global should_run
     if not should_run:
-        print("[MAD] Timer stopped.")
         return None
 
     s = bpy.context.scene.audio_rig_settings
     obj = s.object_ref
     bpy.context.scene["mad_audio_level"] = current_volume
-    print(f"[MAD] Updating audio level: {current_volume:.3f}")
 
     if s.record_to_timeline:
-        refresh_recording_strip()
+        try:
+            refresh_recording_strip()
+        except Exception as e:
+            print(f"[MAD] Timeline refresh failed: {e}")
 
     if not obj:
         return s.update_interval
@@ -221,20 +284,37 @@ class AUDIO_OT_Start(bpy.types.Operator):
     def execute(self, context):
         global stream, should_run
         s = context.scene.audio_rig_settings
+
+        # Release any previous session so the device isn't still held open
+        _stop_stream()
+        _close_wav_safely()
         should_run = True
 
+        mic_index = _resolve_device(s.mic_list)
+        used_fallback = False
+        stream = None
         try:
-            print("[MAD] Selected mic:", s.mic_list)
-            mic_index = int(s.mic_list.split(":")[0])
-            print(f"[MAD] Using input device index: {mic_index}")
-
-            stream = sd.InputStream(device=mic_index, channels=1, dtype='float32', callback=audio_callback)
-            stream.start()
-            print("[MAD] Microphone stream started successfully.")
+            if mic_index is not None:
+                try:
+                    stream = sd.InputStream(device=mic_index, channels=1, dtype='float32', callback=audio_callback)
+                    stream.start()
+                except Exception as e:
+                    print(f"[MAD] Selected device failed ({e}); trying system default.")
+                    stream = None
+            if stream is None:
+                used_fallback = mic_index != sd.default.device[0]
+                stream = sd.InputStream(channels=1, dtype='float32', callback=audio_callback)
+                stream.start()
         except Exception as e:
             print(f"[MAD] Failed to start mic stream: {e}")
             self.report({'ERROR'}, f"Failed to start mic stream: {e}")
+            should_run = False
+            _stop_stream()
             return {'CANCELLED'}
+
+        print(f"[MAD] Microphone stream started (device index {stream.device}).")
+        if used_fallback:
+            self.report({'WARNING'}, "Selected mic unavailable; using system default input")
 
         if s.record_to_timeline:
             try:
@@ -253,13 +333,9 @@ class AUDIO_OT_Stop(bpy.types.Operator):
     bl_options = {'REGISTER'}
 
     def execute(self, context):
-        global stream, should_run
+        global should_run
         should_run = False
-        if stream:
-            print("[MAD] Stopping stream.")
-            stream.stop()
-            stream.close()
-            stream = None
+        _stop_stream()
         strip = stop_recording(context)
         if strip is not None:
             self.report({'INFO'}, f"Recording saved: {record_path}")
@@ -279,6 +355,7 @@ class AUDIO_PT_MicDriverPanel(bpy.types.Panel):
         global should_run
 
         layout.prop(s, "mic_list")
+        layout.operator("wm.audio_refresh_mics", icon='FILE_REFRESH')
         layout.prop(s, "object_ref")
         if s.object_ref and s.object_ref.type == 'ARMATURE':
             layout.prop(s, "bone_name")
@@ -297,6 +374,17 @@ class AUDIO_PT_MicDriverPanel(bpy.types.Panel):
         else:
             layout.label(text="Audio Driver: Inactive", icon='PAUSE')
 
+class AUDIO_OT_RefreshMics(bpy.types.Operator):
+    bl_idname = "wm.audio_refresh_mics"
+    bl_label = "Refresh Devices"
+    bl_options = {'REGISTER'}
+
+    def execute(self, context):
+        # EnumProperty items rebuild on the next UI draw
+        context.area.tag_redraw()
+        self.report({'INFO'}, "Microphone list refreshed")
+        return {'FINISHED'}
+
 # Register mad_audio_level on the Scene properly
 def ensure_audio_level_property():
     if not hasattr(bpy.types.Scene, "mad_audio_level"):
@@ -313,6 +401,7 @@ classes = (
     AudioRigSettings,
     AUDIO_OT_Start,
     AUDIO_OT_Stop,
+    AUDIO_OT_RefreshMics,
     AUDIO_PT_MicDriverPanel,
 )
 
@@ -323,6 +412,8 @@ def register():
     bpy.types.Scene.audio_rig_settings = bpy.props.PointerProperty(type=AudioRigSettings)
 
 def unregister():
+    _stop_stream()
+    _close_wav_safely()
     for cls in reversed(classes):
         bpy.utils.unregister_class(cls)
     del bpy.types.Scene.audio_rig_settings
