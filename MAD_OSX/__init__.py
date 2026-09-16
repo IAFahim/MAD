@@ -1,7 +1,7 @@
 bl_info = {
     "name": "MAD (Microphone Audio Driver)",
     "author": "F1dg3t",
-    "version": (3, 11, 0),
+    "version": (3, 14, 0),
     "blender": (4, 2, 0),
     "location": "View3D > Sidebar > MAD",
     "description": "Use your Microphone as an Animation Driver in Blender.",
